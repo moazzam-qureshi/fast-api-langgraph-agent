@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
     
     # ENTER lifespan: properly enter the async context manager
     async with AsyncPostgresSaver.from_conn_string(
-        "postgresql://postgres:postgres@postgres:5432/postgres"
+        os.getenv("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/postgres")
     ) as saver:
         await saver.setup()  # initialize tables if needed
         app.state.checkpointer = saver
