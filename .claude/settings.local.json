@@ -19,7 +19,8 @@
       "Bash(railway init:*)",
       "Bash(railway status:*)",
       "Bash(openssl rand:*)",
-      "Bash(bash railway-deploy.sh)"
+      "Bash(bash railway-deploy.sh)",
+      "Bash(mv:*)"
     ],
     "deny": []
   }
