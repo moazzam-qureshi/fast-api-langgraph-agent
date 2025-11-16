@@ -1,9 +1,18 @@
 """Document model for knowledge base storage."""
-from sqlalchemy import Column, String, DateTime, Integer, Text, ForeignKey, func
+from sqlalchemy import Column, String, DateTime, Integer, Text, ForeignKey, func, Enum
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from uuid import uuid4
 from .threads import Base
+import enum
+
+
+class IngestionStatus(enum.Enum):
+    """Enum for document ingestion status."""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class Document(Base):
@@ -23,8 +32,10 @@ class Document(Base):
     bucket_name = Column(String, nullable=False, default="documents")
     content_type = Column(String, nullable=False)  # MIME type
     document_metadata = Column(Text, nullable=True)  # JSON field for additional metadata
+    ingestion_status = Column(Enum(IngestionStatus), default=IngestionStatus.PENDING, nullable=False)
+    ingestion_error = Column(Text, nullable=True)  # Store error message if ingestion fails
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
-    # Relationship to user (optional, for convenience)
-    # user = relationship("User", backref="documents")
+    # Relationship to chunks
+    chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")

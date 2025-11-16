@@ -16,3 +16,12 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def get_db_sync() -> Generator[Session, None, None]:
+    """Synchronous database session for Celery tasks."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

@@ -11,24 +11,74 @@ import os
 from typing import List, Optional
 from uuid import UUID
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Local imports
 from database import get_db, engine
-from models import Base, User, Document
+from models import Base, User, Document, DocumentChunk, IngestionStatus
 from schemas import (
     ThreadCreate, ThreadUpdate, ThreadResponse,
     UserCreate, UserLogin, UserUpdate, UserResponse, Token,
-    DocumentUpload, DocumentResponse, DocumentListResponse
+    DocumentUpload, DocumentResponse, DocumentListResponse,
+    IngestionStatusResponse, DocumentSearchRequest, DocumentSearchResponse, DocumentSearchResult
 )
-from services import ThreadService, AuthService, DocumentService, minio_service
+from services import ThreadService, AuthService, DocumentService, minio_service, vector_store_service
+from services.ingestion import ingest_document
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create threads table if it doesn't exist
+    # First, ensure pgvector extension is enabled
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            conn.commit()
+            logger.info("pgvector extension enabled")
+        except Exception as e:
+            logger.error(f"Failed to create pgvector extension: {e}")
+    
+    # Create tables if they don't exist
     Base.metadata.create_all(bind=engine)
+    
+    # Add missing columns to existing tables (migration)
+    with engine.connect() as conn:
+        try:
+            # Check if ingestion_status column exists
+            result = conn.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'documents' 
+                AND column_name = 'ingestion_status'
+            """))
+            
+            if not result.fetchone():
+                # Add missing columns to documents table
+                logger.info("Adding missing columns to documents table")
+                conn.execute(text("""
+                    ALTER TABLE documents 
+                    ADD COLUMN IF NOT EXISTS ingestion_status VARCHAR DEFAULT 'pending',
+                    ADD COLUMN IF NOT EXISTS ingestion_error TEXT
+                """))
+                conn.commit()
+                logger.info("Added ingestion columns to documents table")
+        except Exception as e:
+            logger.error(f"Error during migration: {e}")
+    
+    # Create vector index for better performance
+    from services.vectorstore import vector_store_service
+    db = next(get_db())
+    try:
+        vector_store_service.create_vector_index(db)
+    except Exception as e:
+        logger.error(f"Failed to create vector index: {e}")
+    finally:
+        db.close()
     
     # ENTER lifespan: properly enter the async context manager
     async with AsyncPostgresSaver.from_conn_string(
@@ -72,16 +122,6 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "fastapi-minimal"}
-
-@app.post("/stream")
-async def stream(req: ChatRequest):
-    # access the compiled graph from app.state
-    simple_graph = app.state.graph
-
-    return StreamingResponse(
-        create_sse_stream(simple_graph, {"user_query": req.message}, req.thread_id),
-        media_type="text/event-stream"
-    )
 
 @app.get("/session/{thread_id}")
 async def get_session(thread_id: str):
@@ -151,6 +191,30 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 def get_current_user_id(request: Request) -> str:
     """Extract user ID from request headers."""
     return request.headers.get("X-User-ID", "default-user")
+
+
+# Stream endpoint with authentication
+@app.post("/stream")
+async def stream(
+    req: ChatRequest,
+    current_user: User = Depends(get_current_user)
+):
+    # access the compiled graph from app.state
+    simple_graph = app.state.graph
+
+    # Build input with user ID and RAG parameters
+    input_data = {
+        "user_query": req.message,
+        "user_id": str(current_user.id),
+        "use_rag": req.use_rag,
+        "rag_k": req.rag_k,
+        "rag_threshold": req.rag_threshold
+    }
+
+    return StreamingResponse(
+        create_sse_stream(simple_graph, input_data, req.thread_id),
+        media_type="text/event-stream"
+    )
 
 
 # Thread management endpoints
@@ -487,6 +551,8 @@ async def upload_document(
             content_type=document.content_type,
             bucket_name=document.bucket_name,
             metadata=json.loads(document.document_metadata) if document.document_metadata else None,
+            ingestion_status=document.ingestion_status,
+            ingestion_error=document.ingestion_error,
             created_at=document.created_at,
             updated_at=document.updated_at
         )
@@ -525,6 +591,8 @@ async def list_documents(
             content_type=doc.content_type,
             bucket_name=doc.bucket_name,
             metadata=json.loads(doc.document_metadata) if doc.document_metadata else None,
+            ingestion_status=doc.ingestion_status,
+            ingestion_error=doc.ingestion_error,
             created_at=doc.created_at,
             updated_at=doc.updated_at
         )
@@ -567,6 +635,8 @@ async def get_document(
         content_type=document.content_type,
         bucket_name=document.bucket_name,
         metadata=json.loads(document.document_metadata) if document.document_metadata else None,
+        ingestion_status=document.ingestion_status,
+        ingestion_error=document.ingestion_error,
         created_at=document.created_at,
         updated_at=document.updated_at
     )
@@ -682,5 +752,137 @@ async def delete_document(
         )
     
     return {"message": "Document deleted successfully"}
+
+
+# Document ingestion and RAG endpoints
+@app.post("/documents/{document_id}/ingest")
+async def trigger_document_ingestion(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> dict:
+    """Trigger background ingestion for a document."""
+    # Get document and verify ownership
+    document = DocumentService.get_document(
+        db=db,
+        document_id=document_id,
+        user_id=current_user.id
+    )
+    
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found"
+        )
+    
+    # Check if already processing or completed
+    if document.ingestion_status == IngestionStatus.PROCESSING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Document is already being processed"
+        )
+    
+    if document.ingestion_status == IngestionStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Document has already been ingested. Delete and re-upload to process again."
+        )
+    
+    # Trigger Celery task
+    task = ingest_document.delay(str(document.id), str(current_user.id))
+    
+    return {
+        "message": "Ingestion started",
+        "document_id": str(document_id),
+        "task_id": task.id
+    }
+
+
+@app.get("/documents/{document_id}/ingestion-status", response_model=IngestionStatusResponse)
+async def get_ingestion_status(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> IngestionStatusResponse:
+    """Get the ingestion status of a document."""
+    # Get document and verify ownership
+    document = DocumentService.get_document(
+        db=db,
+        document_id=document_id,
+        user_id=current_user.id
+    )
+    
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found"
+        )
+    
+    # Get chunk statistics if ingested
+    chunks_count = None
+    total_tokens = None
+    
+    if document.ingestion_status == IngestionStatus.COMPLETED:
+        chunks = db.query(
+            func.count(DocumentChunk.id).label('count'),
+            func.sum(DocumentChunk.token_count).label('total_tokens')
+        ).filter(
+            DocumentChunk.document_id == document.id
+        ).first()
+        
+        if chunks:
+            chunks_count = chunks.count
+            total_tokens = chunks.total_tokens
+    
+    return IngestionStatusResponse(
+        document_id=document.id,
+        status=document.ingestion_status,
+        error_message=document.ingestion_error,
+        chunks_count=chunks_count,
+        total_tokens=total_tokens
+    )
+
+
+@app.post("/documents/search", response_model=DocumentSearchResponse)
+async def search_documents(
+    search_request: DocumentSearchRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> DocumentSearchResponse:
+    """Search across user's documents using vector similarity."""
+    # Search for similar chunks
+    results = vector_store_service.search_similar_chunks(
+        query=search_request.query,
+        user_id=current_user.id,
+        k=search_request.k,
+        score_threshold=search_request.score_threshold,
+        filter_document_ids=search_request.document_ids,
+        db=db
+    )
+    
+    # Get document information for results
+    formatted_results = []
+    for result in results:
+        # Get document info
+        document = db.query(Document).filter(
+            Document.id == result["document_id"]
+        ).first()
+        
+        if document:
+            formatted_results.append(DocumentSearchResult(
+                chunk_id=result["chunk_id"],
+                document_id=result["document_id"],
+                filename=document.filename,
+                chunk_text=result["chunk_text"],
+                chunk_index=result["chunk_index"],
+                similarity_score=result["similarity_score"],
+                metadata=result["metadata"]
+            ))
+    
+    return DocumentSearchResponse(
+        query=search_request.query,
+        results=formatted_results,
+        total_results=len(formatted_results)
+    )
 
 

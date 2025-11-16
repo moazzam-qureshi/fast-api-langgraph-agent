@@ -13,3 +13,16 @@ python-multipart==0.0.9
 email-validator==2.1.1
 minio==7.2.5
 python-magic==0.4.27
+
+# RAG dependencies
+celery[redis]
+redis
+langchain-core
+langchain-postgres
+langchain-openai
+pypdf
+python-docx
+tiktoken
+pgvector
+langchain-community
+markdown
