@@ -22,7 +22,13 @@ class MinIOService:
         )
         
         self.default_bucket = "documents"
-        self._ensure_bucket_exists(self.default_bucket)
+        
+        # Only try to create bucket if not in Railway environment or if MinIO is available
+        if os.getenv("RAILWAY_ENVIRONMENT") != "production":
+            try:
+                self._ensure_bucket_exists(self.default_bucket)
+            except Exception as e:
+                logger.warning(f"Could not create bucket on startup: {e}. Will retry on first use.")
     
     def _ensure_bucket_exists(self, bucket_name: str) -> None:
         """Ensure the bucket exists, create if it doesn't."""
@@ -58,6 +64,9 @@ class MinIOService:
         bucket_name = bucket_name or self.default_bucket
         
         try:
+            # Ensure bucket exists before uploading
+            self._ensure_bucket_exists(bucket_name)
+            
             self.client.put_object(
                 bucket_name=bucket_name,
                 object_name=object_name,
