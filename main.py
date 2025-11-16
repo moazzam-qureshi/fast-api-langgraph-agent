@@ -27,7 +27,7 @@ from schemas import (
 from services import ThreadService, AuthService, DocumentService, minio_service, vector_store_service
 from services.ingestion import ingest_document
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 
 
@@ -121,7 +121,51 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "fastapi-minimal"}
+    return {"status": "healthy", "service": "fastapi-langgraph-agent"}
+
+
+@app.get("/health/detailed")
+async def detailed_health_check(db: Session = Depends(get_db)):
+    """Comprehensive health check for all services."""
+    health_status = {
+        "status": "healthy",
+        "service": "fastapi-langgraph-agent",
+        "checks": {}
+    }
+    
+    # Check database connection
+    try:
+        db.execute(text("SELECT 1"))
+        db.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'"))
+        health_status["checks"]["database"] = {"status": "healthy", "type": "postgresql_with_pgvector"}
+    except Exception as e:
+        health_status["checks"]["database"] = {"status": "unhealthy", "error": str(e)}
+        health_status["status"] = "unhealthy"
+    
+    # Check MinIO connection
+    try:
+        buckets = minio_service.client.list_buckets()
+        health_status["checks"]["minio"] = {"status": "healthy", "buckets": len(buckets)}
+    except Exception as e:
+        health_status["checks"]["minio"] = {"status": "unhealthy", "error": str(e)}
+        health_status["status"] = "degraded"
+    
+    # Check Redis connection (through Celery)
+    try:
+        from celery_app import celery_app
+        celery_stats = celery_app.control.inspect().stats()
+        health_status["checks"]["redis"] = {"status": "healthy" if celery_stats else "degraded"}
+    except Exception as e:
+        health_status["checks"]["redis"] = {"status": "unhealthy", "error": str(e)}
+        health_status["status"] = "degraded"
+    
+    # Check OpenAI API key configuration
+    health_status["checks"]["openai"] = {
+        "status": "configured" if os.getenv("OPENAI_API_KEY") else "not_configured"
+    }
+    
+    return health_status
+
 
 @app.get("/session/{thread_id}")
 async def get_session(thread_id: str):
