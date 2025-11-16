@@ -9,7 +9,17 @@
       "Bash(git commit:*)",
       "Bash(git push:*)",
       "Bash(git remote set-url:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(railway --version)",
+      "Bash(npm --version)",
+      "Bash(npm install:*)",
+      "Bash(railway login:*)",
+      "Bash(railway whoami:*)",
+      "Bash(railway link:*)",
+      "Bash(railway init:*)",
+      "Bash(railway status:*)",
+      "Bash(openssl rand:*)",
+      "Bash(bash railway-deploy.sh)"
     ],
     "deny": []
   }
