@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Query, Request, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, status, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -14,9 +14,13 @@ import json
 
 # Local imports
 from database import get_db, engine
-from models import Base, User
-from schemas import ThreadCreate, ThreadUpdate, ThreadResponse, UserCreate, UserLogin, UserUpdate, UserResponse, Token
-from services import ThreadService, AuthService
+from models import Base, User, Document
+from schemas import (
+    ThreadCreate, ThreadUpdate, ThreadResponse,
+    UserCreate, UserLogin, UserUpdate, UserResponse, Token,
+    DocumentUpload, DocumentResponse, DocumentListResponse
+)
+from services import ThreadService, AuthService, DocumentService, minio_service
 from sqlalchemy.orm import Session
 
 
@@ -435,5 +439,248 @@ async def update_current_user(
         created_at=updated_user.created_at,
         updated_at=updated_user.updated_at
     )
+
+
+# Document management endpoints
+@app.post("/documents/upload", response_model=DocumentResponse)
+async def upload_document(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> DocumentResponse:
+    """
+    Upload a document to the knowledge base.
+    
+    Allowed file types: .pdf, .txt, .md, .doc, .docx
+    Maximum file size: 10MB
+    """
+    # Read file content
+    file_content = await file.read()
+    file_size = len(file_content)
+    
+    # Reset file position for upload
+    await file.seek(0)
+    
+    try:
+        # Upload document
+        document = DocumentService.upload_document(
+            db=db,
+            user_id=current_user.id,
+            filename=file.filename,
+            file_data=file.file,
+            file_size=file_size,
+            content_type=file.content_type or "application/octet-stream"
+        )
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to upload document"
+            )
+        
+        return DocumentResponse(
+            id=document.id,
+            user_id=document.user_id,
+            filename=document.filename,
+            file_type=document.file_type,
+            file_size=document.file_size,
+            content_type=document.content_type,
+            bucket_name=document.bucket_name,
+            metadata=json.loads(document.document_metadata) if document.document_metadata else None,
+            created_at=document.created_at,
+            updated_at=document.updated_at
+        )
+    
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
+@app.get("/documents", response_model=DocumentListResponse)
+async def list_documents(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> DocumentListResponse:
+    """List all documents for the authenticated user."""
+    documents = DocumentService.get_user_documents(
+        db=db,
+        user_id=current_user.id,
+        skip=skip,
+        limit=limit
+    )
+    
+    total = DocumentService.count_user_documents(db, current_user.id)
+    
+    document_responses = [
+        DocumentResponse(
+            id=doc.id,
+            user_id=doc.user_id,
+            filename=doc.filename,
+            file_type=doc.file_type,
+            file_size=doc.file_size,
+            content_type=doc.content_type,
+            bucket_name=doc.bucket_name,
+            metadata=json.loads(doc.document_metadata) if doc.document_metadata else None,
+            created_at=doc.created_at,
+            updated_at=doc.updated_at
+        )
+        for doc in documents
+    ]
+    
+    return DocumentListResponse(
+        documents=document_responses,
+        total=total,
+        page=(skip // limit) + 1,
+        page_size=limit
+    )
+
+
+@app.get("/documents/{document_id}", response_model=DocumentResponse)
+async def get_document(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> DocumentResponse:
+    """Get metadata for a specific document."""
+    document = DocumentService.get_document(
+        db=db,
+        document_id=document_id,
+        user_id=current_user.id
+    )
+    
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found"
+        )
+    
+    return DocumentResponse(
+        id=document.id,
+        user_id=document.user_id,
+        filename=document.filename,
+        file_type=document.file_type,
+        file_size=document.file_size,
+        content_type=document.content_type,
+        bucket_name=document.bucket_name,
+        metadata=json.loads(document.document_metadata) if document.document_metadata else None,
+        created_at=document.created_at,
+        updated_at=document.updated_at
+    )
+
+
+@app.get("/documents/{document_id}/download")
+async def download_document(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Download a document directly."""
+    # Get document metadata
+    document = DocumentService.get_document(
+        db=db,
+        document_id=document_id,
+        user_id=current_user.id
+    )
+    
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found"
+        )
+    
+    # Download file content from MinIO
+    file_content = minio_service.download_file(
+        object_name=document.minio_object_name,
+        bucket_name=document.bucket_name
+    )
+    
+    if not file_content:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to download file"
+        )
+    
+    # Return file as streaming response
+    from io import BytesIO
+    import urllib.parse
+    
+    # Encode filename for HTTP headers (handle Unicode characters)
+    safe_filename = document.filename.encode('ascii', 'ignore').decode('ascii')
+    if safe_filename != document.filename:
+        # If filename contains non-ASCII characters, use RFC 5987 encoding
+        encoded_filename = urllib.parse.quote(document.filename)
+        content_disposition = f"attachment; filename=\"{safe_filename}\"; filename*=UTF-8''{encoded_filename}"
+    else:
+        content_disposition = f'attachment; filename="{document.filename}"'
+    
+    return StreamingResponse(
+        BytesIO(file_content),
+        media_type=document.content_type,
+        headers={
+            "Content-Disposition": content_disposition
+        }
+    )
+
+
+
+
+@app.get("/documents/{document_id}/url")
+async def get_document_url(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> dict:
+    """
+    Get document download URL.
+    Note: Use /documents/{id}/download for direct download instead.
+    """
+    document = DocumentService.get_document(
+        db=db,
+        document_id=document_id,
+        user_id=current_user.id
+    )
+    
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found"
+        )
+    
+    # Return the API endpoint for downloading
+    download_url = f"/documents/{document_id}/download"
+    
+    return {
+        "download_url": download_url,
+        "filename": document.filename,
+        "content_type": document.content_type,
+        "note": "Use this URL with your authentication token to download the file"
+    }
+
+
+
+@app.delete("/documents/{document_id}")
+async def delete_document(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> dict:
+    """Delete a document from the knowledge base."""
+    success = DocumentService.delete_document(
+        db=db,
+        document_id=document_id,
+        user_id=current_user.id
+    )
+    
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found or deletion failed"
+        )
+    
+    return {"message": "Document deleted successfully"}
 
 

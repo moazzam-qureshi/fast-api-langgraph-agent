@@ -1,12 +1,12 @@
 """
-Simple script to create the threads and users tables.
+Simple script to create the threads, users, and documents tables.
 Run this once to set up the tables in your PostgreSQL database.
 
 Usage: python create_threads_table.py
 """
 
 from sqlalchemy import create_engine, text
-from models import Base, Thread, User  # Import models to register them
+from models import Base, Thread, User, Document  # Import models to register them
 from database import DATABASE_URL
 
 if __name__ == "__main__":
@@ -39,5 +39,16 @@ if __name__ == "__main__":
             print("✓ Users table created successfully!")
         else:
             print("✗ Failed to create users table")
+            
+        # Check documents table
+        result = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'documents')"
+        ))
+        documents_exists = result.scalar()
+        
+        if documents_exists:
+            print("✓ Documents table created successfully!")
+        else:
+            print("✗ Failed to create documents table")
     
     engine.dispose()
